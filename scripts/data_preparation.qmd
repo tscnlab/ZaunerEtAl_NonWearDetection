@@ -1,0 +1,232 @@
+---
+title: "Data preparation for non-wear detection algorithm"
+author: Johannes Zauner
+format: 
+  html:
+    code-tools: true
+    code-link: true
+    self-contained: true
+---
+
+## Preface
+
+This script imports and prepares a few days worth of wearable data from `VEET` and `ActLumus` devices, in addition to a log detailing activities and, importantly, non-wear times. 
+
+- The left temple of the `VEET`s is oriented straight ahead, whereas the right temple is oriented downwards by 20° (`?check`). 
+
+- The `ActLumus` `Lanyard` was worn at chest-height, the `Armband` on the right wrist.
+
+## Setup
+
+```{r}
+#| message: false
+library(tidyverse)
+library(LightLogR)
+library(readxl)
+library(here)
+tz <- "Europe/Berlin"
+coordinates <- c(48.1, 11.6)
+```
+
+### Files
+
+```{r}
+#log file with entries of activities and non-wear
+log_file <- list.files(here("data", "log"), full.names = TRUE)
+#ActLumus files
+ActLumus_files <- list.files(here("data", "ActLumus"), full.names = TRUE)
+ActLumus_files <- 
+  ActLumus_files[str_detect(ActLumus_files, "Report", negate = TRUE)]
+#VEET files
+VEET_files <- list.files(here("data", "VEET"), full.names = TRUE)
+VEET_files <- list.files(VEET_files, full.names = TRUE, pattern = "Temple")
+```
+
+## Import
+
+### Logs
+
+```{r}
+Logs <- read_excel(log_file)
+```
+
+### ActLumus
+
+```{r}
+ActLumus <- import$ActLumus(ActLumus_files, tz = tz, auto.id = "\\((.*)\\)")
+```
+
+### VEET
+
+```{r}
+VEET_light <- 
+  import$VEET(VEET_files, 
+              tz, 
+              auto.id = ".*_Temple", 
+              modality = "ALS",
+              not.before = "2026-01-01"
+              )
+VEET_activity <- 
+  import$VEET(VEET_files, 
+              tz, 
+              auto.id = ".*_Temple", 
+              modality = "IMU",
+              not.before = "2026-01-01"
+              )
+```
+
+## Cleaning/Preparation
+
+### Logs
+
+```{r}
+#setting the date component of start to Date
+date(Logs$start) <- date(Logs$Date)
+dates <- date(Logs$Date) |> unique()
+
+#convert from statechanges to states
+Logs <-
+  Logs |> 
+    select(-Date) |> 
+    sc2interval(start, wear, starting.state = "Off", 
+                length.restriction = Inf) |> 
+  select(-State)
+```
+
+### ActLumus
+
+The `ActLumus` data will be skipped for now, as their recording times do not overlap with the `Logs` or the `VEET` data.
+
+### VEET
+
+#### Dataset overview
+
+This section gives an overview of the `VEET_light` data.
+
+```{r}
+VEET_light |> summary_overview(Lux)
+VEET_light |> has_irregulars()
+VEET_light |> dominant_epoch()
+VEET_light |> durations(Lux, show.interval = TRUE)
+```
+
+The summaries show that the two VEET devices (`left temple` and `right temple`) cover quite some time but contain little data (86% of data is missing). The data is irregular (which the import summaries already indicated), and covers roughly 3.2 days of data, given a `2 second` measurement interval.
+
+#### Adjusting time scales
+
+`VEET` data are recorded somewhat irregularly. To get to a regular scale, we will aggregate the data to `10 second` bins. This will also reduce the data size while still being short enough to allow meaningful analysis of the variation. Repeating this step for the activity data has the nice benefit that time stamps align perfectly between the two sets.
+
+> In case a higher resolution is needed, the `unit` argument can be adjusted at will.
+
+```{r}
+unit <- "10 secs"
+VEET_light <- VEET_light |> aggregate_Datetime(unit)
+VEET_activity <- VEET_activity |>  aggregate_Datetime(unit)
+```
+
+```{r}
+VEET_light |> has_irregulars()
+```
+
+#### Join light and activity data
+
+```{r}
+VEET <-
+  VEET_light |> 
+  left_join(VEET_activity, 
+            by = c("Id", "Datetime"), 
+            suffix = c(".light", ".activity"))
+```
+
+## Join wearable data with log data
+
+This step adds the `Log` information to the wearable `VEET` data.
+
+```{r}
+VEET <-
+  VEET |> 
+  ungroup() |> #ungrouping (and regrouping) is necessary, as the log data extends beyond the individual devices
+  add_states(Logs, 
+             start.colname = Interval, 
+             end.colname = Interval,
+             force.tz = TRUE
+             ) |> 
+  group_by(Id)
+```
+
+#### Reduce data down to relevant days
+
+We are only interested in times where we have log data. Thus, we will remove all times without a wear state.
+
+```{r}
+VEET <-
+  VEET |> 
+  filter(!is.na(wear))
+```
+
+To remove implicit gaps on relevant days, we will fill those times in.
+
+```{r}
+VEET <-
+  VEET |> 
+  add_Date_col(group.by = TRUE) |> 
+  filter(Date %in% dates) |> 
+  gap_handler(full.days = TRUE)
+```
+
+## Explorative descriptives
+
+To get an overview of the resulting data, we create a few summaries and plots
+
+```{r}
+VEET |> summary_overview(Lux)
+```
+
+
+```{r}
+VEET |> gg_overview()
+```
+
+```{r}
+VEET |> gap_table(Lux) |> gt::cols_hide(contains("_n"))
+```
+
+```{r}
+VEET |> durations(Lux, show.missing = TRUE) |> select(-total)
+```
+
+```{r}
+VEET |> 
+  group_by(wear, .add = TRUE) |> 
+  durations(Lux, show.missing = TRUE) |> 
+  group_by(Id) |> 
+  gt::gt()
+```
+
+```{r}
+#| fig-height: 5
+#| fig-width: 8
+#| message: false
+#| warning: false
+VEET |> 
+  group_by(Id) |>
+  sample_groups(sample = 2) |> #set to 1 or two to get individual samples
+  gg_day(Lux, geom = "line", group = Id, y.axis.label = "Illuminance (lx)") |> 
+  gg_states(wear, aes_fill = wear, ymax = 0, alpha = 1) |> 
+  gg_photoperiod(coordinates) +
+  ggplot2::scale_fill_manual(values=c("red3", "green3"))
+```
+
+## Export
+
+```{r}
+path <- paste0(here("data", "cleaned"),"/wear_data_cleaned.RData") 
+save(VEET, file = path)
+```
+
+## Sessioninfo
+
+```{r}
+sessionInfo()
+```
+
